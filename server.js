@@ -1,180 +1,335 @@
-# File: telegram_monitor.py (with inter-channel duplicate check)
+// File: server.js
 
-import re
-import asyncio
-import websockets
-import json
-import time
-import logging
-from telethon import TelegramClient, events
+// Import necessary modules
+const WebSocket = require('ws');
+const http = require('http');
 
-# --- Configuration ---
-# Get these from my.telegram.org
-API_ID = 12345678  # Replace with your actual API ID (integer)
-API_HASH = "your_api_hash_here"  # Replace with your actual API Hash (string)
-PHONE_NUMBER = '+60149032373' # Replace with your phone number in international format (e.g., '+1234567890')
+// --- Configuration ---
+const PORT = 8765; // Port the WebSocket server will listen on
+const PING_INTERVAL = 30000; // Interval for sending pings (milliseconds)
+// --- End Configuration ---
 
-# Session file name (created automatically by Telethon)
-SESSION_NAME = "telegram_stake_monitor_session_dup_check" # Updated session name
+// --- Logging Helper ---
+const log = (level, message, ...optionalParams) => {
+  const timestamp = new Date().toISOString();
+  const levelUpper = level.toUpperCase();
+  const logFunc = console[levelUpper === 'WARN' ? 'warn' : levelUpper === 'ERROR' ? 'error' : 'log'] || console.log;
+  logFunc(`[${timestamp}] ${levelUpper}: ${message}`, ...optionalParams);
+};
 
-# List of chat IDs (integers) to monitor.
-TARGET_CHATS = [-1002140237447, -1001768427488] # Your original IDs
+// Create an HTTP server (useful for health checks)
+const server = http.createServer((req, res) => {
+  if (req.url === '/health') {
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({
+        status: 'ok',
+        monitorConnected: !!telegramMonitorSocket,
+        userscriptCount: userScriptSockets.size,
+        uptime: process.uptime()
+    }));
+  } else {
+    res.writeHead(200, { 'Content-Type': 'text/plain' });
+    res.end(`WebSocket Server active. Monitor: ${telegramMonitorSocket ? 'Connected' : 'Disconnected'}. Userscripts: ${userScriptSockets.size}. Try /health for JSON status.`);
+  }
+});
 
-# Regular expression to find the code.
-CODE_REGEX = re.compile(r'\bcode:\s*([a-zA-Z0-9\-_]+)\b', re.IGNORECASE)
+// Create a WebSocket server attached to the HTTP server
+const wss = new WebSocket.Server({ server });
 
-# WebSocket server details
-SERVER_URI = "ws://localhost:8765/"
-CLIENT_ID = "TelegramMonitor_VPS_v1_DupCheck" # Updated Client ID
+// --- Client Management ---
+let telegramMonitorSocket = null; // Holds the single allowed Telegram monitor connection
+let telegramMonitorId = null; // Store the ID the monitor provides
+const userScriptSockets = new Map(); // Stores connected userscript clients (ws.id -> ws)
 
-# --- Behavior ---
-RECONNECT_DELAY_SECONDS = 5
-# Timeout (in seconds) for ignoring duplicate codes seen across any monitored channel
-DUPLICATE_CODE_TIMEOUT_SECONDS = 60 * 5  # 300 seconds = 5 minutes (Adjust as needed)
-# --- End Configuration ---
+log('INFO', `WebSocket server starting on port ${PORT}...`);
 
-# --- Logging Setup ---
-logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] %(message)s', datefmt='%Y-%m-%d %H:%M:%S')
-logger = logging.getLogger(__name__)
+// --- WebSocket Event Handling ---
 
-# --- Global State ---
-websocket_connection = None
-# Dictionary to track recently sent codes {code_string: timestamp_sent}
-sent_codes = {}
-# --- End Global State ---
+wss.on('connection', (ws, req) => {
+  // Assign a unique ID to each connection
+  ws.id = `ws_${Date.now()}_${Math.random().toString(36).substring(2, 9)}`;
+  ws.isAlive = true; // Flag for ping/pong keepalive
+  ws.clientType = null; // Determined by 'identify' message
+  ws.username = null; // Specific to userscripts
+  const remoteAddress = req.socket.remoteAddress || req.headers['x-forwarded-for']; // Get client IP
 
-# --- WebSocket Functions ---
+  log('INFO', `[${ws.id}] Client connected from ${remoteAddress}. Waiting for identification...`);
 
-async def connect_to_websocket_server():
-    """Establishes and maintains the WebSocket connection to the Node.js server."""
-    global websocket_connection
-    while True:
-        try:
-            logger.info(f"[WS] Attempting connection to server: {SERVER_URI}")
-            async with websockets.connect(SERVER_URI, ping_interval=None, open_timeout=10) as ws:
-                websocket_connection = ws
-                logger.info("[WS] Connection established successfully.")
+  // Handle 'pong' responses to keep connection alive
+  ws.on('pong', () => {
+    ws.isAlive = true;
+    // log('DEBUG', `[${ws.id}] Pong received.`); // Keep debug logs minimal
+  });
 
-                identify_message = json.dumps({
-                    "type": "identify",
-                    "client_type": "telegram_monitor",
-                    "id": CLIENT_ID
-                })
-                await ws.send(identify_message)
-                logger.info(f"[WS] Sent identification to server (ID: {CLIENT_ID}).")
+  // Handle messages received from clients
+  ws.on('message', (messageBuffer) => {
+    let messageString = '<Buffer>';
+    let data;
+    try {
+      messageString = messageBuffer.toString('utf-8');
+      data = JSON.parse(messageString);
+    } catch (e) {
+      log('ERROR', `[${ws.id}] Failed to parse JSON message: ${e.message}. Message: ${messageString.substring(0, 100)}`);
+      ws.close(1003, 'Invalid data format'); // 1003: Unsupported Data
+      return;
+    }
 
-                async for message in ws:
-                    try:
-                        data = json.loads(message)
-                        logger.debug(f"[WS] Received message from server: {data}")
-                        if data.get("type") == "pong": pass
-                        elif data.get("type") == "ack": logger.info(f"[WS] Server acknowledged code: {data.get('code')}")
-                    except json.JSONDecodeError: logger.warning(f"[WS] Received non-JSON message: {message[:100]}")
-                    except Exception as e: logger.error(f"[WS] Error processing server message: {e}")
+    const clientDesc = getClientDescription(ws); // Get description like "[Monitor: <id>]" or "[User: <name>]"
 
-        except (websockets.exceptions.ConnectionClosedError, websockets.exceptions.ConnectionClosedOK) as e:
-            reason = f"Reason: {e.reason}, Code: {e.code}" if hasattr(e, 'reason') else str(e)
-            logger.warning(f"[WS] Connection closed ({reason}). Reconnecting in {RECONNECT_DELAY_SECONDS}s...")
-        except ConnectionRefusedError: logger.error(f"[WS] Connection refused by server at {SERVER_URI}. Is it running? Retrying in {RECONNECT_DELAY_SECONDS}s...")
-        except Exception as e: logger.error(f"[WS] Connection error: {type(e).__name__} - {e}. Reconnecting in {RECONNECT_DELAY_SECONDS}s...")
-        finally:
-            websocket_connection = None
-            await asyncio.sleep(RECONNECT_DELAY_SECONDS)
+    // --- Message Type Handling ---
+    switch (data.type) {
+      case 'identify':
+        handleIdentification(ws, data, remoteAddress); // Pass remote address for logging
+        break;
 
-# --- MODIFIED FUNCTION: Re-implements duplicate check ---
-async def send_code_via_websocket(code):
-    """Sends a detected code via WebSocket if not sent recently from any channel."""
-    global websocket_connection, sent_codes
+      case 'new_code':
+        // CRITICAL: Only accept codes from the identified Telegram Monitor
+        if (ws !== telegramMonitorSocket) {
+          log('WARN', `${clientDesc} Received 'new_code' from non-monitor client. Ignoring.`);
+          return;
+        }
+        const code = data.code;
+        if (!code || typeof code !== 'string') {
+          log('WARN', `${clientDesc} Received invalid 'new_code' payload from monitor:`, data);
+          return;
+        }
+        // Log reception before broadcasting
+        log('INFO', `${clientDesc} Received code: "${code}". Broadcasting...`);
+        broadcastCodeToUserscripts(code, clientDesc);
+        // Optional: Send acknowledgment back to monitor
+        // try { ws.send(JSON.stringify({ type: 'ack', code: code })); } catch (e) { log('ERROR', `${clientDesc} Failed to send ack:`, e); }
+        break;
 
-    current_time = time.time()
+      case 'ping': // Handle client-initiated pings if needed
+         log('DEBUG', `${clientDesc} Received client-initiated ping. Sending pong.`);
+         try {
+             ws.send(JSON.stringify({ type: 'pong' }));
+         } catch (e) { log('ERROR', `${clientDesc} Failed to send pong:`, e); }
+         break;
 
-    # --- Duplicate Check Logic ---
-    # Remove codes from tracking that are older than the timeout period
-    codes_to_remove = [c for c, ts in sent_codes.items() if current_time - ts > DUPLICATE_CODE_TIMEOUT_SECONDS]
-    for c in codes_to_remove:
-        try:
-            del sent_codes[c]
-            logger.debug(f"Removed expired code '{c}' from duplicate tracking.")
-        except KeyError:
-            pass # Already removed somehow, ignore
+      default:
+        log('WARN', `${clientDesc} Received unknown message type: ${data.type}`);
+        // Consider closing connection for unexpected messages if strict protocol is desired
+        // ws.close(1008, 'Unknown message type'); // 1008: Policy Violation
+    }
+  });
 
-    # Check if the code was sent recently (within the timeout)
-    if code in sent_codes:
-        time_since_sent = current_time - sent_codes[code]
-        logger.info(f"Ignoring duplicate code '{code}'. Sent {time_since_sent:.0f}s ago (Timeout: {DUPLICATE_CODE_TIMEOUT_SECONDS}s).")
-        return # Do not send
-    # --- End Duplicate Check Logic ---
+  // Handle client disconnection
+  ws.on('close', (code, reasonBuffer) => {
+    const reason = reasonBuffer && reasonBuffer.length > 0 ? reasonBuffer.toString('utf-8') : 'No reason';
+    const clientDesc = getClientDescription(ws, true); // Get description even if client is gone
+    log('INFO', `${clientDesc} Client disconnected. Code: ${code}, Reason: "${reason}"`);
+    cleanupClient(ws); // Perform cleanup actions
+    // Log remaining counts after cleanup
+    log('INFO', `[SERVER] State update -> Monitor: ${telegramMonitorSocket ? 'Connected' : 'Disconnected'}, UserScripts: ${userScriptSockets.size}`);
+  });
 
-    # If not a recent duplicate, proceed to send
-    if websocket_connection and not websocket_connection.closed:
-        try:
-            message = json.dumps({"type": "new_code", "code": code})
-            await websocket_connection.send(message)
-            # Log confirmation *after* successful send
-            logger.info(f"[WS] -> Sent code '{code}' to server.")
-            # Add the code to tracking *after* successful send
-            sent_codes[code] = current_time
-        except websockets.exceptions.ConnectionClosed:
-             logger.warning(f"[WS] Attempted to send code '{code}' but connection was closed.")
-        except Exception as e:
-            logger.error(f"[WS] Failed to send code '{code}': {type(e).__name__} - {e}")
-    else:
-        logger.warning(f"[WS] Cannot send code '{code}'. Connection inactive.")
+  // Handle WebSocket errors
+  ws.on('error', (error) => {
+    const clientDesc = getClientDescription(ws, true);
+    log('ERROR', `${clientDesc} WebSocket error:`, error);
+    // Don't cleanup here, 'close' event usually follows and handles cleanup
+    // Ensure the socket is terminated if it's still open after an error
+    if (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING) {
+        ws.terminate();
+    }
+  });
+});
 
-# --- Telegram Functions ---
+// --- Helper Functions ---
 
-async def setup_telegram_client():
-    """Initializes the Telethon client and defines the message handler."""
-    logger.info("[TG] Initializing Telegram client...")
-    client = TelegramClient(SESSION_NAME, API_ID, API_HASH)
+// Gets a descriptive string for logging based on client type and ID/username
+function getClientDescription(ws, includeIdEvenIfTyped = false) {
+    if (!ws) return '[UnknownClient]';
+    const baseId = `[ID: ${ws.id}]`; // Use ws.id as fallback identifier
+    if (ws === telegramMonitorSocket) {
+        return `[Monitor: ${telegramMonitorId || ws.id}]`;
+    } else if (ws.clientType === 'userscript') {
+        return `[User: ${ws.username || ws.id}]`;
+    } else {
+        // Unidentified or unknown
+        return includeIdEvenIfTyped ? baseId : '[UnidentifiedClient]';
+    }
+}
 
-    @client.on(events.NewMessage(chats=TARGET_CHATS))
-    async def new_message_handler(event):
-        """Handles new messages in the target chats."""
-        message_text = event.message.message
-        try:
-            chat_info = await event.get_chat()
-            chat_name = getattr(chat_info, 'title', f"ChatID:{event.chat_id}")
-        except Exception:
-            chat_name = f"ChatID:{event.chat_id}"
+// Handles the 'identify' message from a new client
+function handleIdentification(ws, data, remoteAddress) {
+  const currentDesc = getClientDescription(ws); // Get current description (likely Unidentified)
+  if (ws.clientType) { // Check if already identified
+    log('WARN', `${getClientDescription(ws)} Attempted to identify again as ${data.client_type}. Ignoring.`);
+    return;
+  }
 
-        logger.debug(f"[TG] Received message in '{chat_name}'")
+  log('INFO', `[${ws.id}] Identification attempt from ${remoteAddress}: ${JSON.stringify(data)}`);
 
-        if not message_text: return
+  if (data.client_type === 'telegram_monitor' && data.id) {
+    if (telegramMonitorSocket) {
+      log('WARN', `[${ws.id}] Denied: Attempted connection from a second Telegram Monitor (${data.id}). Closing.`);
+      ws.close(1008, 'Telegram monitor already connected');
+      return;
+    }
+    ws.clientType = 'telegram_monitor';
+    telegramMonitorSocket = ws;
+    telegramMonitorId = data.id;
+    log('INFO', `✅ [Monitor: ${telegramMonitorId}] Identified successfully (ID: ${ws.id})`);
+    broadcastServerStatus(`Telegram Monitor connected (${telegramMonitorId}).`);
 
-        match = CODE_REGEX.search(message_text)
-        if match:
-            code = match.group(1)
-            logger.info(f"[TG] Detected code '{code}' in '{chat_name}'. Checking recency...")
-            # Call the send function, which now includes the duplicate check
-            asyncio.create_task(send_code_via_websocket(code))
+  } else if (data.client_type === 'userscript' && data.username) {
+    ws.clientType = 'userscript';
+    ws.username = data.username;
+    userScriptSockets.set(ws.id, ws); // Add to our map of userscripts
+    log('INFO', `✅ [User: ${ws.username}] Identified successfully (ID: ${ws.id}). Total Users: ${userScriptSockets.size}`);
+    // Send status update to other *userscripts*, exclude self
+    broadcastServerStatus(`User ${ws.username} connected.`, ws.id);
 
-    return client
+  } else {
+    log('WARN', `[${ws.id}] Invalid identification payload received. Closing connection. Payload:`, data);
+    ws.close(1008, 'Invalid identification payload');
+  }
+}
 
-# --- Main Execution ---
+// Broadcasts a code message to all connected userscripts
+function broadcastCodeToUserscripts(code, senderDescription) {
+    const message = JSON.stringify({ type: 'new_code', code: code });
+    let broadcastCount = 0;
 
-async def main():
-    """Runs the WebSocket connector and Telegram client concurrently."""
-    websocket_task = asyncio.create_task(connect_to_websocket_server())
-    telegram_client = await setup_telegram_client()
-    logger.info("[SYSTEM] Starting Telegram client connection...")
-    try:
-        await telegram_client.start(phone=PHONE_NUMBER)
-        logger.info("[SYSTEM] Telegram client started successfully.")
-    except Exception as e:
-        logger.critical(f"[SYSTEM] Failed to start Telegram client: {e}", exc_info=True)
-        return # Exit if Telegram connection fails
+    userScriptSockets.forEach((clientWs, clientId) => {
+        // Check if client is still connected and ready
+        if (clientWs.readyState === WebSocket.OPEN) {
+            try {
+                clientWs.send(message);
+                broadcastCount++;
+            } catch (e) {
+                log('ERROR', `[User: ${clientWs.username || clientId}] Error sending code broadcast:`, e);
+                // Consider terminating client if send fails repeatedly?
+            }
+        } else {
+            // Log and potentially clean up sockets that aren't open but weren't caught by 'close' yet
+            log('WARN', `[User: ${clientWs.username || clientId}] Found non-open socket during broadcast. Will be cleaned up.`);
+            // Optional: Force cleanup immediately userScriptSockets.delete(clientId);
+        }
+    });
+    // Log summary after attempting broadcast
+    log('INFO', `[SERVER] Code "${code}" broadcast attempt finished. Sent to ${broadcastCount} userscript(s).`);
+}
 
-    telegram_task = asyncio.create_task(telegram_client.run_until_disconnected())
-    await asyncio.gather(websocket_task, telegram_task)
+// Broadcasts server status messages (like connect/disconnect) to userscripts
+function broadcastServerStatus(messageText, excludeWsId = null) {
+    const message = JSON.stringify({ type: 'server_status_update', message: messageText });
+    let count = 0;
+    userScriptSockets.forEach((clientWs, clientId) => {
+        // Check exclude ID and readiness
+        if (clientId !== excludeWsId && clientWs.readyState === WebSocket.OPEN) {
+            try {
+                clientWs.send(message);
+                count++;
+            } catch (e) {
+                log('ERROR', `[User: ${clientWs.username || clientId}] Error sending status update:`, e);
+            }
+        }
+    });
+     if (count > 0) {
+        log('INFO', `[SERVER] Broadcasted status update "${messageText.substring(0,50)}..." to ${count} users.`);
+     }
+}
 
-if __name__ == "__main__":
-    logger.info("[SYSTEM] Monitor script starting (with duplicate check)...")
-    try:
-        asyncio.run(main())
-    except KeyboardInterrupt:
-        logger.info("[SYSTEM] Script stopped by user (Ctrl+C).")
-    except Exception as e:
-         logger.critical(f"[SYSTEM] An unhandled exception occurred in main execution: {e}", exc_info=True)
-    finally:
-        logger.info("[SYSTEM] Monitor script finished.")
+// Cleans up resources associated with a disconnected client
+function cleanupClient(ws) {
+  if (ws === telegramMonitorSocket) {
+    telegramMonitorSocket = null;
+    telegramMonitorId = null;
+    // Status update broadcast happens in 'close' handler *after* cleanup
+  } else if (userScriptSockets.has(ws.id)) {
+    userScriptSockets.delete(ws.id);
+    // Status update broadcast happens in 'close' handler *after* cleanup
+  }
+  // If client never identified, no specific cleanup needed beyond socket closure
+}
+
+// --- Ping Interval for Keepalive ---
+// Regularly check if clients are still responsive
+const interval = setInterval(() => {
+    // Use wss.clients which includes all connected clients (monitor + userscripts)
+    wss.clients.forEach(ws => {
+        // Skip sockets that are closing or already closed
+        if (ws.readyState !== WebSocket.OPEN) return;
+
+        const clientDesc = getClientDescription(ws, true); // Get description including ID
+
+        if (ws.isAlive === false) {
+            log('WARN', `${clientDesc} No pong response received within interval. Terminating connection.`);
+            return ws.terminate(); // Force close; 'close' event will handle cleanup
+        }
+
+        // Mark as potentially unresponsive, expecting a pong before next interval
+        ws.isAlive = false;
+        // Send ping request
+        ws.ping((err) => {
+            if (err) {
+                log('ERROR', `${clientDesc} Error sending ping:`, err);
+            } else {
+                // log('DEBUG', `${clientDesc} Ping sent.`);
+            }
+        });
+    });
+}, PING_INTERVAL);
+
+wss.on('close', () => {
+  log('INFO', "[SERVER] WebSocket server instance shutting down. Clearing ping interval.");
+  clearInterval(interval);
+});
+
+// --- Start the HTTP Server ---
+server.listen(PORT, () => {
+  log('INFO', `🚀 HTTP server listening on port ${PORT}`);
+  log('INFO', `🚀 WebSocket server available at ws://<your_vps_ip>:${PORT}`);
+});
+
+// --- Graceful Shutdown Handling ---
+const shutdown = (signal) => {
+    log('INFO', `\n[SERVER] Received ${signal}. Shutting down gracefully...`);
+    clearInterval(interval); // Stop sending pings
+
+    log('INFO', '[SERVER] Closing all WebSocket client connections...');
+    const closePromises = Array.from(wss.clients).map(client =>
+        new Promise(resolve => {
+            if (client.readyState === WebSocket.OPEN) {
+                client.on('close', resolve); // Wait for the close event
+                client.close(1001, 'Server shutting down'); // 1001: Going Away
+                // Add a timeout in case 'close' event doesn't fire
+                setTimeout(() => {
+                     if (client.readyState !== WebSocket.CLOSED) {
+                         log('WARN', `[SERVER] Force terminating client ${getClientDescription(client, true)} during shutdown.`);
+                         client.terminate();
+                     }
+                     resolve();
+                 }, 1000); // 1 second timeout per client
+            } else {
+                resolve(); // Already closed or closing
+            }
+        })
+    );
+
+    // Wait for all clients to close, with a total timeout
+    Promise.all(closePromises).then(() => {
+        log('INFO', "[SERVER] All WebSocket clients closed or terminated.");
+        wss.close(() => { log('INFO', '[SERVER] WebSocket server instance closed.'); });
+        server.close(() => {
+            log('INFO', '[SERVER] HTTP server closed.');
+            process.exit(0); // Exit cleanly
+        });
+    }).catch(err => {
+         log('ERROR', "[SERVER] Error during client shutdown:", err);
+         process.exit(1); // Exit with error code
+    });
+
+    // Force exit if graceful shutdown takes too long
+    setTimeout(() => {
+        log('ERROR', '[SERVER] Graceful shutdown timed out. Forcing exit.');
+        process.exit(1);
+    }, 5000); // 5-second overall timeout
+};
+
+// Listen for termination signals
+process.on('SIGINT', () => shutdown('SIGINT')); // Ctrl+C
+process.on('SIGTERM', () => shutdown('SIGTERM')); // systemd stop, kill command
