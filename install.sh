@@ -1,91 +1,56 @@
-#!/data/data/com.termux/files/usr/bin/bash
+#!/bin/bash
 
-# Ensure Termux is running as the expected user
-if [ "$(whoami)" == "root" ]; then
-  echo "This script should not be run as root in Termux."
-  exit 1
+# This script prepares a Debian/Ubuntu VPS for running the
+# Node.js WebSocket server and Python Telegram monitor.
+
+echo "--- Updating System Packages ---"
+sudo apt update && sudo apt upgrade -y
+
+# Check if sudo is needed again might depend on session timeout
+echo "--- Installing Dependencies (Git, Python3, Pip3, Curl) ---"
+sudo apt install -y git python3 python3-pip curl
+
+# Install Node.js LTS using NodeSource repository
+# See: https://github.com/nodesource/distributions
+echo "--- Installing Node.js (LTS) and npm ---"
+# Check if Node.js is already installed (optional, avoids re-running NodeSource setup)
+if ! command -v node > /dev/null; then
+  echo "Node.js not found, installing..."
+  curl -fsSL https://deb.nodesource.com/setup_lts.x | sudo -E bash -
+  sudo apt install -y nodejs
+else
+  echo "Node.js is already installed. Skipping NodeSource setup."
+  # Optionally, ensure npm is installed if nodejs package didn't include it
+  if ! command -v npm > /dev/null; then
+     echo "npm not found, installing..."
+     sudo apt install -y npm
+  fi
 fi
 
-echo "-------------------------------------"
-echo "Updating Termux package lists..."
-echo "-------------------------------------"
-pkg update -y
 
-echo "-------------------------------------"
-echo "Upgrading installed packages..."
-echo "-------------------------------------"
-# Handle potential dpkg prompts during upgrade non-interactively
-pkg upgrade -y -o Dpkg::Options::="--force-confnew"
-
-echo "------------------------------------------------------------------------"
-echo "Installing core dependencies: Node.js, Python, pip, Git, build tools..."
-echo "------------------------------------------------------------------------"
-# Install nodejs, python, pip (via python-pip package), git
-# Also install build-essential for compiling native modules if needed by pip/npm
-# Add common dependencies for cryptography (used by telethon) and other native modules
-# Added 'rust' because it was needed for 'oxc-parser' in Nuxt setup, might help elsewhere too.
-pkg install nodejs python python-pip git build-essential libffi openssl rust nano -y
-
-# Check if installations were successful (basic check)
-if ! command -v node &> /dev/null || ! command -v python &> /dev/null || ! command -v pip &> /dev/null; then
-    echo "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!"
-    echo "ERROR: Failed to install core dependencies (Node.js/Python/pip)."
-    echo "Please check network connection and run 'pkg update && pkg upgrade' again."
-    echo "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!"
-    exit 1
-fi
-
-# Clear pip cache (optional, can sometimes resolve issues)
-# echo "Clearing pip cache..."
-# pip cache purge
-
-echo "-------------------------------------------------------"
-echo "Installing Python dependencies for telegram_monitor.py..."
-echo "-------------------------------------------------------"
-# Ensure pip is up-to-date
-pip install --upgrade pip
-# Install necessary Python libraries for the script
-echo "Installing telethon and websockets..."
-pip install telethon websockets
-
-# Verify Python packages (basic check)
-if ! pip show telethon &> /dev/null || ! pip show websockets &> /dev/null; then
-    echo "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!"
-    echo "ERROR: Failed to install Python dependencies."
-    echo "Check pip output above for errors."
-    echo "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!"
-    # Don't exit, maybe user wants to proceed anyway
-fi
+echo "--- Verifying Installations ---"
+git --version
+python3 --version
+pip3 --version
+node -v
+npm -v
 
 echo ""
-echo "-------------------------------------"
-echo "✅ System dependencies installed."
-echo "-------------------------------------"
+echo "✅ Base dependencies installed successfully."
 echo ""
-echo "NEXT STEPS:"
-echo "====================================="
-echo "1. Ensure you have your project files (server.js, telegram_monitor.py)"
-echo "   in your project directory (e.g., '~/autoclaimer')."
-echo "   If not, navigate to it ('cd ~/autoclaimer') or create them."
-echo ""
-echo "2. Navigate into your project directory:"
-echo "   cd ~/autoclaimer"
-echo ""
-echo "3. Install Node.js dependencies for server.js:"
-echo "   If you don't have a 'package.json', create one first:"
-echo "     npm init -y"
-echo "   Then install the libraries:"
-echo "     npm install express ws"
-echo "   (or if using pnpm: pnpm add express ws)"
-echo ""
-echo "4. Configure 'telegram_monitor.py':"
-echo "   Edit the file (e.g., 'nano telegram_monitor.py') and enter your"
-echo "   Telegram API_ID, API_HASH, PHONE_NUMBER, and TARGET_CHATS."
-echo ""
-echo "5. Run the services (each in a separate Termux session):"
-echo "   Session 1: node server.js"
-echo "   Session 2: python telegram_monitor.py"
-echo "====================================="
-echo ""
-echo "IMPORTANT: Remember to run 'npm install' (or 'pnpm add') *inside* your project directory!"
-echo ""
+echo "--- Next Steps ---"
+echo "1. Clone your Git repository or upload your files (`server.js`, `telegram_monitor.py`) to the VPS."
+echo "2. Navigate (`cd`) into your project directory."
+echo "3. Install Node.js dependencies: npm install ws"
+echo "4. Install Python dependencies: pip3 install telethon websockets"
+echo "5. Configure API keys and chat IDs in 'telegram_monitor.py'."
+echo "6. IMPORTANT: Update the WebSocket URL in your Tampermonkey userscripts to point to 'ws://<your_vps_ip_or_domain>:8765/'."
+echo "7. Configure your VPS firewall to allow TCP traffic on port 8765 (e.g., 'sudo ufw allow 8765/tcp')."
+echo "8. Run the scripts using a process manager like pm2:"
+echo "   - sudo npm install -g pm2"
+echo "   - pm2 start server.js --name stake-ws-server"
+echo "   - pm2 start telegram_monitor.py --interpreter python3 --name stake-tg-monitor"
+echo "   - pm2 startup # <-- Follow instructions"
+echo "   - pm2 save"
+echo "   - pm2 list"
+echo "   - pm2 logs <name>"
